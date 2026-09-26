@@ -6,9 +6,8 @@
 # mpegtsmux cannot take AAC-LATM (LOAS) without decoding it, ffmpeg's mpegts muxer can.
 # Players need HEVC and AAC-LATM support (e.g. hls.js with LATM support).
 #
-# Audio: the first track stays muxed with the video (100/, as before); every further track gets its
-# own audio-only segments (a1/, a2/ ...) with the same numbering, for HLS alternate audio renditions.
-# <channel>/tracks.json describes all tracks (codec, language, channels ...) for the playlist/player.
+# Audio: every audio track of the channel is copied into the same segments (100/), in source order, with
+# its language and audio type (e.g. audio description) in the PMT. hls.js plays the first one.
 #
 # Timestamps: the segments keep the PTS/DTS/PCR of the source (-copyts, mpegts_copyts). ffmpeg does not
 # repair source timestamp jumps then, and its segment muxer counts the cut points from the first
@@ -95,12 +94,14 @@ class EncoderPipeline:
 
 	outputRoot and registerSegments exist for tests: a test run must not write into /media/live or
 	the database while the production repacker of the same channel is running.
+	allAudioTracks=False keeps only the first audio track.
 	copyTimestamps=False makes ffmpeg rebase the timestamps to 0 (and repair jumps) instead."""
 	def __init__(self, sourceServer, channelVdrId, decoderThreads=None, encoderThreads=None, encoderSpeed=None,
 			targetResolution=None, videoCodec=None, targetFPS=None, outputRoot='/media/live', registerSegments=True,
 			allAudioTracks=True, copyTimestamps=True):
 		self.uri = sourceServer + channelVdrId + '.ts'
 		self.registerSegments = registerSegments
+		self.allAudioTracks = allAudioTracks
 		self.copyTimestamps = copyTimestamps
 		self.process = None
 
@@ -110,16 +111,9 @@ class EncoderPipeline:
 		self.nextFileIndex = startfileindex
 
 		# destination location (quality 100 only, the lower qualities needed an encoder)
-		self.channelDirectory = os.path.join(outputRoot, str(currentchannelid))
 		self.destinationdirectory0 = self.formatdestinationdir(outputRoot, currentchannelid, '100')
 		self.destination0 = self.destinationdirectory0 + '%010d.ts'
 		os.makedirs(self.destinationdirectory0, exist_ok=True)
-
-		# further audio tracks get their own segment directories (a1/, a2/ ...)
-		self.audioTracks = self.probeAudioTracks() if allAudioTracks else []
-		for track in self.audioTracks[1:]:
-			os.makedirs(self.formatdestinationdir(outputRoot, currentchannelid, track['directory']), exist_ok=True)
-		self.writeTrackInfo(currentchannelid)
 
 	def formatdestinationdir(self, outputRoot, selectedChannelId, qualityPrefix):
 		return os.path.join(outputRoot, str(selectedChannelId), qualityPrefix) + '/'
@@ -142,46 +136,6 @@ class EncoderPipeline:
 
 		return (startFileIndex, self.currentChannel.id)
 
-	def probeAudioTracks(self):
-		"""Audio tracks of the channel in ffmpeg's 0:a:N order. The first one stays muxed with the video
-		(directory 100), every further one is written to its own directory a<N>."""
-		try:
-			result = subprocess.run([ffprobeBinary, '-v', 'error', '-analyzeduration', '3000000', '-probesize', '5000000',
-				'-show_entries', 'stream=codec_type,codec_name,channels,channel_layout:stream_tags=language'
-				':stream_disposition=visual_impaired,hearing_impaired', '-of', 'json', self.uri],
-				capture_output=True, text=True, timeout=30)
-			streams = json.loads(result.stdout or '{}').get('streams', [])
-		except (subprocess.TimeoutExpired, ValueError) as e:
-			print('audio track probe failed, only the first audio track is kept:', e)
-			return []
-		tracks = []
-		for stream in streams:
-			if stream.get('codec_type') != 'audio':
-				continue
-			index = len(tracks)
-			language = stream.get('tags', {}).get('language', 'und')
-			disposition = stream.get('disposition', {})
-			tracks.append({
-				'name': 'a%d' % index,
-				'index': index,
-				'directory': '100' if index == 0 else 'a%d' % index,
-				'codec': stream.get('codec_name'),
-				'language': language if len(language) == 3 and language.isalpha() else 'und',
-				'channels': stream.get('channels'),
-				'layout': stream.get('channel_layout'),
-				'visualImpaired': bool(disposition.get('visual_impaired')),
-				'hearingImpaired': bool(disposition.get('hearing_impaired')),
-			})
-		print('audio tracks:', ', '.join('%s %s/%s' % (t['name'], t['codec'], t['language']) for t in tracks))
-		return tracks
-
-	def writeTrackInfo(self, channelId):
-		info = {'channel': channelId, 'tracks': self.audioTracks}
-		tmp = os.path.join(self.channelDirectory, 'tracks.json.tmp')
-		with open(tmp, 'w') as f:
-			json.dump(info, f, indent=1)
-		os.replace(tmp, os.path.join(self.channelDirectory, 'tracks.json'))
-
 	def ffmpegArguments(self):
 		segmentOptions = ['-c', 'copy', '-f', 'segment', '-segment_format', 'mpegts',
 			'-segment_time', str(defaultSegmentDuration / 1000000000),
@@ -195,16 +149,12 @@ class EncoderPipeline:
 			'-reconnect_delay_max', '5', '-rw_timeout', '15000000'] + (
 			['-copyts'] if self.copyTimestamps else []) + [
 			'-i', self.uri,
-			# first video and first audio track as before; '?' keeps channels without one working
-			'-map', '0:v:0?', '-map', '0:a:0?'] + segmentOptions + [
+			# first video, all (or the first) audio tracks; '?' keeps channels without one working
+			'-map', '0:v:0?', '-map', '0:a?' if self.allAudioTracks else '0:a:0?'] + segmentOptions + [
 			# cut at the first keyframe after every 10 s; each finished segment is reported on stdout
 			# as "file,start,end" (stream time in seconds)
 			'-segment_list', 'pipe:1', '-segment_list_type', 'csv',
 			self.destination0]
-		# further audio tracks: audio-only segments cut at every 10 s, numbered like the video segments
-		for track in self.audioTracks[1:]:
-			arguments += ['-map', '0:a:%d' % track['index']] + segmentOptions + [
-				os.path.join(self.channelDirectory, track['directory'], '%010d.ts')]
 		return arguments
 
 	def run(self):
