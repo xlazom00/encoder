@@ -1,49 +1,41 @@
 #!/usr/bin/python3
 
+# Live repacker: VDR channel (MPEG-TS over HTTP) -> 10 s MPEG-TS segments, nothing is re-encoded.
+#
+# Video (HEVC) and audio (AAC-LATM on DVB-T2) are copied by ffmpeg's segment muxer. GStreamer's
+# mpegtsmux cannot take AAC-LATM (LOAS) without decoding it, ffmpeg's mpegts muxer can.
+# Players need HEVC and AAC-LATM support (e.g. hls.js with LATM support).
+#
+# Audio: the first track stays muxed with the video (100/, as before); every further track gets its
+# own audio-only segments (a1/, a2/ ...) with the same numbering, for HLS alternate audio renditions.
+# <channel>/tracks.json describes all tracks (codec, language, channels ...) for the playlist/player.
+#
+# Timestamps: the segments keep the PTS/DTS/PCR of the source (-copyts, mpegts_copyts). ffmpeg does not
+# repair source timestamp jumps then, and its segment muxer counts the cut points from the first
+# timestamp of the run, so ffmpeg is restarted after a jump, when it stops finishing segments and once
+# a day (libavformat unwraps only one 33-bit PTS wrap, which comes every 26.5 h).
+
 import time
 import sqlobject
 from sqlobject import *
 import MySQLdb.converters
 import sys, os
 import math
-from datetime import datetime
-
-import gi
-
-gi.require_version('Gst', '1.0')
-from gi.repository import GObject, Gst
-#, GstMpegts
-
-GObject.threads_init()
-Gst.init(None)
-
-videoBitrate0 =  4200
-videoKeyFrameInterval0 = 250
-videoBitrate1 =   200
-videoKeyFrameInterval1 = 250
-videoBitrate2 =   10
-videoKeyFrameInterval2 = 25
-#audioBitrate =    69536
-audioBitrate =    91920
+import json
+import subprocess
+import threading
 
 # in ms
 appStartTime = int(round(time.time() * 1000))
 defaultSegmentDuration = 10000000000 #10s segments
 defaultMissingSegments = 2
+# in s
+stallTimeout = 45
+maxRunTime = 24 * 3600
 
-#lastSegmentEndTime = 0
-
-timeStamps = [0,0,0]
-invalidTests = 0
-
-encoders = [1,0,0]
-withDeinterlace = 0
-#topx264speed = 4
-
-#threads = 4
-
-###### for dump dot
-###### export GST_DEBUG_DUMP_DOT_DIR=""
+# ffmpeg/ffprobe binaries, can be overridden for tests
+ffmpegBinary = os.environ.get('FFMPEG', 'ffmpeg')
+ffprobeBinary = os.environ.get('FFPROBE', 'ffprobe')
 
 def _mysql_timestamp_converter(raw):
 	"""Convert a MySQL TIMESTAMP to a floating point number representing
@@ -86,491 +78,51 @@ class HealthCheck:
 		result = list(res)
 		if (len(result) == 0):
 			return 0
-		
+
 		missingSegments = math.floor((appStartTime - (result[0].startTime + (defaultSegmentDuration / 1000000))) / (defaultSegmentDuration / 1000000))
-		
+
 		print('last file in table:', result[0].fileId)
 		print(appStartTime - (result[0].startTime + (defaultSegmentDuration / 1000000)))
 		print(missingSegments)
-		
+
 		if (missingSegments>defaultMissingSegments):
 			sys.exit(1)
 
-class OutPut(Gst.Bin):
-	def __init__(self, startFileIndex, outputDirectory, index):
-		Gst.Bin.__init__(self)
-		self.startFileId = startFileIndex
-		self.fileId = startFileIndex
-
-		self.mux = Gst.ElementFactory.make('mpegtsmux', None)
-		self.sink = Gst.ElementFactory.make('splitmuxsink', 'splitmuxsink' + index)
-
-		self.add(self.sink)
-		self.sink.set_property('start-index', startFileIndex)
-		self.sink.set_property('location', outputDirectory)
-		self.sink.set_property('max-files', 0)
-		self.sink.set_property('max-size-time', defaultSegmentDuration) #10s segments
-		self.sink.set_property('muxer', self.mux)
-		self.sink.set_property('send-keyframe-requests', 'true')
-
-		self.mux.set_property('pat-interval', 900000)
-		self.mux.set_property('pmt-interval', 900000)
-
-class AudioEncoder(Gst.Bin):
-	def __init__(self, bitrate):
-		super(Gst.Bin, self).__init__()
-		self.audioconvert = Gst.ElementFactory.make('audioconvert', None)
-		self.encoder = Gst.ElementFactory.make('fdkaacenc', None)
-		self.encoder.set_property('bitrate', bitrate)  # tools bitrate
-
-
-		self.aacparse = Gst.ElementFactory.make('aacparse', None)
-		self.aacparse.set_property('disable-passthrough', 'true')
-
-		self.qOut = Gst.ElementFactory.make('queue', None)
-
-		self.add(self.audioconvert)
-		self.add(self.encoder)
-		self.add(self.aacparse)
-		self.add(self.qOut)
-
-		self.audioconvert.link(self.encoder)
-		self.encoder.link_filtered(self.aacparse,
-			Gst.caps_from_string('audio/mpeg, stream-format=adts')
-		)
-
-		self.aacparse.link_filtered(self.qOut,
-			Gst.caps_from_string('audio/mpeg, stream-format=adts')
-		)
-
-		# Add Ghost Pads
-		self.add_pad(
-			Gst.GhostPad.new('sink', self.audioconvert.get_static_pad('sink'))
-		)
-
-		self.add_pad(
-			Gst.GhostPad.new('src', self.qOut.get_static_pad('src'))
-		)
-
-
-class VideoEncoder(Gst.Bin):
-	def __init__(self, codec, bitrate, keyFrameInterval, encoderThreads, encoderSpeed):
-		super(Gst.Bin, self).__init__()
-		if codec == 'H264':
-			self.initH264(bitrate, keyFrameInterval, encoderThreads, encoderSpeed)
-		elif codec == 'H265':
-			self.initH265(bitrate, keyFrameInterval, encoderThreads, encoderSpeed)
-
-	def initH264(self, bitrate, keyFrameInterval, encoderThreads, encoderSpeed):
-		# Create elements
-		self.inQ = Gst.ElementFactory.make('queue2', None)
-		self.encoder = Gst.ElementFactory.make('x264enc', None)
-		self.parser = Gst.ElementFactory.make('h264parse', None)
-		self.qOut = Gst.ElementFactory.make('queue2', None)
-
-		# Add elements to Bin
-		self.add(self.inQ)
-		self.add(self.encoder)
-		self.add(self.parser)
-		self.add(self.qOut)
-
-		self.inQ.set_property('max-size-buffers', 800)
-		self.inQ.set_property('max-size-bytes', 0)
-		self.qOut.set_property('max-size-bytes', 0)
-
-		# Set tools properties
-		opt_string = 'bitrate=' + str(bitrate)
-		self.encoder.set_property('bitrate', bitrate)  # video tools bitrate
-
-		if(keyFrameInterval < 100):
-			opt_string += (':aud:scenecut=2:rc-lookahead=2:threads=1:vbv-maxrate='+str(bitrate)+':vbv-bufsize='+str(bitrate*2)+':keyint='+str(keyFrameInterval)+':min-keyint='+str(keyFrameInterval)+':scenecut=0:no-scenecut')
-#			self.encoder.set_property('vbv-buf-capacity', 1000) 
-			self.encoder.set_property('tune', 1)
-			self.encoder.set_property('speed-preset', 5)
-		elif(bitrate < 500):
-			opt_string += (':threads='+str(2)+':aud:vbv-maxrate='+str(bitrate)+':vbv-bufsize='+str(bitrate*2)+':keyint='+str(keyFrameInterval)+':min-keyint='+str(keyFrameInterval)+':scenecut=0:no-scenecut')
-			self.encoder.set_property('psy-tune', 0)
-			self.encoder.set_property('speed-preset', 5)
-		else:
-			opt_string += (':threads='+str(encoderThreads)+':aud:vbv-maxrate='+str(bitrate)+':vbv-bufsize='+str(bitrate*2)+':keyint='+str(keyFrameInterval)+':min-keyint=50')
-			self.encoder.set_property('speed-preset', encoderSpeed)
-			self.encoder.set_property('psy-tune', 4)
-
-		print(opt_string)
-		self.encoder.set_property('option-string',opt_string)
-
-		self.inQ.link(self.encoder)
-
-		self.encoder.link_filtered(self.parser,
-			Gst.caps_from_string('video/x-h264, profile=high')
-		)
-
-		self.parser.link_filtered(self.qOut,
-			Gst.caps_from_string('video/x-h264, alignment=au, stream-format=byte-stream')
-		)
-
-		# Add Ghost Pads
-		self.add_pad(
-			Gst.GhostPad.new('sink', self.inQ.get_static_pad('sink'))
-		)
-
-		self.add_pad(
-			Gst.GhostPad.new('src', self.qOut.get_static_pad('src'))
-		)
-
-		Gst.debug_bin_to_dot_file( self, Gst.DebugGraphDetails.ALL, "videoenc")
-
-	def initH265(self, bitrate, keyFrameInterval, encoderThreads, encoderSpeed):
-		# Create elements
-		self.inQ = Gst.ElementFactory.make('queue2', None)
-		self.encoder = Gst.ElementFactory.make('x265enc', None)
-		self.parser = Gst.ElementFactory.make('h265parse', None)
-		self.qOut = Gst.ElementFactory.make('queue2', None)
-
-		# Add elements to Bin
-		self.add(self.inQ)
-		self.add(self.encoder)
-		self.add(self.parser)
-		self.add(self.qOut)
-
-		self.inQ.set_property('max-size-buffers', 800)
-		self.inQ.set_property('max-size-bytes', 0)
-		self.qOut.set_property('max-size-bytes', 0)
-
-		# Set tools properties
-		opt_string = 'bitrate=' + str(bitrate)
-		self.encoder.set_property('bitrate', bitrate)  # video tools bitrate
-
-		if(keyFrameInterval < 100):
-			opt_string += (':aud:scenecut=2:rc-lookahead=2:threads=1:vbv-maxrate='+str(bitrate)+':vbv-bufsize='+str(bitrate*2)+':keyint='+str(keyFrameInterval)+':min-keyint='+str(keyFrameInterval)+':scenecut=0:no-scenecut')
-#			self.encoder.set_property('vbv-buf-capacity', 1000) 
-			self.encoder.set_property('tune', 1)
-			self.encoder.set_property('speed-preset', 5)
-		elif(bitrate < 500):
-			opt_string += (':threads='+str(2)+':aud:vbv-maxrate='+str(bitrate)+':vbv-bufsize='+str(bitrate*2)+':keyint='+str(keyFrameInterval)+':min-keyint='+str(keyFrameInterval)+':scenecut=0:no-scenecut')
-			self.encoder.set_property('psy-tune', 0)
-			self.encoder.set_property('speed-preset', 5)
-		else:
-			opt_string += (':pools='+str(encoderThreads)+':aud:vbv-maxrate='+str(bitrate)+':vbv-bufsize='+str(bitrate*2)+':keyint='+str(keyFrameInterval)+':min-keyint=50')
-			opt_string += (':asm=avx512')
-			# ':frame-threads='+str(encoderThreads)+
-			self.encoder.set_property('speed-preset', encoderSpeed)
-
-		
-		self.encoder.set_property('log-level', 2)
-		print(opt_string)
-		self.encoder.set_property('option-string',opt_string)
-
-		self.inQ.link(self.encoder)
-
-		self.encoder.link_filtered(self.parser,
-			Gst.caps_from_string('video/x-h265, profile=main')
-		)
-
-		self.parser.link_filtered(self.qOut,
-			Gst.caps_from_string('video/x-h265, alignment=au, stream-format=byte-stream')
-		)
-
-		# Add Ghost Pads
-		self.add_pad(
-			Gst.GhostPad.new('sink', self.inQ.get_static_pad('sink'))
-		)
-
-		self.add_pad(
-			Gst.GhostPad.new('src', self.qOut.get_static_pad('src'))
-		)
-
-		Gst.debug_bin_to_dot_file( self, Gst.DebugGraphDetails.ALL, "videoenc")
-
-
 class EncoderPipeline:
-	def __init__(self, sourceServer, channelVdrId, decoderThreads, encoderThreads, encoderSpeed, targetResolution, videoCodec='H264', targetFPS=25):
-		self.uri = sourceServer + channelVdrId
+	"""Repacks a VDR channel into 10 s MPEG-TS segments and registers every finished segment in
+	file_segment. The decoder/encoder/resolution/codec/fps arguments of the former transcoding
+	pipeline are kept for the channel scripts and ignored.
+
+	outputRoot and registerSegments exist for tests: a test run must not write into /media/live or
+	the database while the production repacker of the same channel is running.
+	copyTimestamps=False makes ffmpeg rebase the timestamps to 0 (and repair jumps) instead."""
+	def __init__(self, sourceServer, channelVdrId, decoderThreads=None, encoderThreads=None, encoderSpeed=None,
+			targetResolution=None, videoCodec=None, targetFPS=None, outputRoot='/media/live', registerSegments=True,
+			allAudioTracks=True, copyTimestamps=True):
+		self.uri = sourceServer + channelVdrId + '.ts'
+		self.registerSegments = registerSegments
+		self.copyTimestamps = copyTimestamps
+		self.process = None
 
 		(startfileindex, currentchannelid) = self.getchannelinfo(channelVdrId)
 		self.startFileIndex = startfileindex
-		#self.startFileIndex = 1
-		#currentchannelid = 256
+		# numbering continues here when ffmpeg is restarted
+		self.nextFileIndex = startfileindex
 
-		# destination location
-		self.destination0 = self.formatdestination(currentchannelid, '100')
-		self.destination1 = self.formatdestination(currentchannelid, '030')
-		self.destination2 = self.formatdestination(currentchannelid, '005')
+		# destination location (quality 100 only, the lower qualities needed an encoder)
+		self.channelDirectory = os.path.join(outputRoot, str(currentchannelid))
+		self.destinationdirectory0 = self.formatdestinationdir(outputRoot, currentchannelid, '100')
+		self.destination0 = self.destinationdirectory0 + '%010d.ts'
+		os.makedirs(self.destinationdirectory0, exist_ok=True)
 
-		# create destination directory
-		self.destinationdirectory0 = self.formatdestinationdir(currentchannelid, '100')
-		self.destinationdirectory1 = self.formatdestinationdir(currentchannelid, '030')
-		self.destinationdirectory2 = self.formatdestinationdir(currentchannelid, '005')
-		try:
-			os.makedirs(self.destinationdirectory0)
-		except OSError:
-			print(self.destinationdirectory0 + ' exist')
-			pass
-		try:
-			os.makedirs(self.destinationdirectory1)
-		except OSError:
-			print(self.destinationdirectory1 + ' exist')
-			pass
-		try:
-			os.makedirs(self.destinationdirectory2)
-		except OSError:
-			print(self.destinationdirectory2 + ' exist')
-			pass
+		# further audio tracks get their own segment directories (a1/, a2/ ...)
+		self.audioTracks = self.probeAudioTracks() if allAudioTracks else []
+		for track in self.audioTracks[1:]:
+			os.makedirs(self.formatdestinationdir(outputRoot, currentchannelid, track['directory']), exist_ok=True)
+		self.writeTrackInfo(currentchannelid)
 
-		self.lastSegmentTimeStamp = None
-		self.lastSegmentTimeStampTested = 0
-
-		# print destination
-
-		# clean table records
-		# FileSegment.dropTable()
-		# FileSegment.createTable()
-		#
-
-		# return
-
-		self.mainloop = GObject.MainLoop()
-		self.pipeline = Gst.Pipeline()
-		self.bus = self.pipeline.get_bus()
-
-		self.bus.add_signal_watch()
-		self.bus.enable_sync_message_emission()
-
-		# self.bus.connect("sync-message::element", self.on_sync_message)
-		self.bus.connect("message", self.on_message)
-
-		self.bus.connect('message::eos', self.on_eos)
-		self.bus.connect('message::error', self.on_error)
-		#         self.bus.connect('message::eos', self.on_eos)
-
-		# Create elements
-		self.player = Gst.ElementFactory.make('uridecodebin3', None)
-		caps = Gst.Caps.from_string("video/x-h265; audio/mpeg; audio/x-ac3; text/x-raw")
-		self.player.set_property('caps', caps)
-
-		self.player.set_property('uri', self.uri + ".ts")
-		self.player.set_property('use-buffering', 'true')
-		#self.player.set_property('force-sw-decoders', 'true')
-		self.player.set_property('buffer-size', 620000000)
-
-
-		self.videoParseDecoder = Gst.ElementFactory.make('h265parse', None)
-		self.videoDecoder = Gst.ElementFactory.make('avdec_h265', None)
-		self.videoDecoder.set_property('max-threads', decoderThreads);
-		self.videoDecoder.set_property('output-corrupt', 'true');
-
-		self.pipeline.add(self.videoParseDecoder)
-		self.pipeline.add(self.videoDecoder)
-
-		if(withDeinterlace):
-			#self.videoDeinterlace = Gst.ElementFactory.make('avdeinterlace')
-			self.videoDeinterlace = Gst.ElementFactory.make('yadif')
-			self.videoDeinterlace.set_property('mode',1)
-
-		self.inputVideoRate = Gst.ElementFactory.make('videorate', None)
-		self.inputAudioRate = Gst.ElementFactory.make('audiorate', None)
-
-		self.audioParseDecoder = Gst.ElementFactory.make('aacparse', None)
-		self.audioDecoder = Gst.ElementFactory.make('avdec_aac_latm', None)
-
-		self.videoDecTee = Gst.ElementFactory.make('tee', None)
-		self.audioDecTee = Gst.ElementFactory.make('tee', None)
-
-		self.encAudioTee = Gst.ElementFactory.make('tee', None)
-
-		self.audioEncoder = AudioEncoder(audioBitrate)
-
-		# Add elements to pipeline
-		self.pipeline.add(self.player)
-		self.pipeline.add(self.audioParseDecoder)
-		self.pipeline.add(self.audioDecoder)
-		self.pipeline.add(self.audioEncoder)
-
-		self.pipeline.add(self.inputAudioRate)
-		self.pipeline.add(self.inputVideoRate)
-
-		if(withDeinterlace):
-			self.pipeline.add(self.videoDeinterlace)
-
-		self.pipeline.add(self.videoDecTee)
-		self.pipeline.add(self.audioDecTee)
-		self.pipeline.add(self.encAudioTee)
-
-
-		#	self.hole = Gst.ElementFactory.make('audiotestsrc', None)
-		#	self.hole.set_property('is-live', 'true');
-		#	self.hole.set_property('wave', 'silence');
-		#	
-		#	self.holeAudioEncoder = AudioEncoder(100)
-
-		if(encoders[2]):
-			self.videoRate2 = Gst.ElementFactory.make('videorate', None)
-			self.videoScale2 = Gst.ElementFactory.make('videoscale', None)
-			self.videoScale2.set_property('method', 3)
-
-			self.videoEncoder2 = VideoEncoder(videoBitrate2, videoKeyFrameInterval2)
-			self.outPut2 = OutPut(self.startFileIndex, self.destination2, "2")
-			self.audioQueue2 = Gst.ElementFactory.make('queue2', None)
-
-			#        self.pipeline.add(self.identity2)
-			self.pipeline.add(self.videoRate2)
-			self.pipeline.add(self.videoScale2)
-			self.pipeline.add(self.videoEncoder2)
-			self.pipeline.add(self.audioQueue2)
-			self.pipeline.add(self.outPut2)
-
-		#        self.pipeline.add(self.hole)
-		#        self.pipeline.add(self.holeAudioEncoder)
-
-
-		if(encoders[1]):
-			self.videoScale1 = Gst.ElementFactory.make('videoscale', None)
-			self.videoScale1.set_property('method', 3)
-
-			self.videoEncoder1 = VideoEncoder(videoBitrate1, videoKeyFrameInterval1)
-			self.outPut1 = OutPut(self.startFileIndex, self.destination1, "1")
-			self.audioQueue1 = Gst.ElementFactory.make('queue2', None)
-
-			self.pipeline.add(self.videoScale1)
-			self.pipeline.add(self.videoEncoder1)
-			self.pipeline.add(self.audioQueue1)
-			self.pipeline.add(self.outPut1)
-
-
-		if(encoders[0]):
-			#self.videoScale0 = Gst.ElementFactory.make('videoscale', None)
-			#self.videoScale0.set_property('method', 3)
-			if(targetFPS == 25):
-				self.videoEncoder0 = VideoEncoder(videoCodec, videoBitrate0, videoKeyFrameInterval0, encoderThreads, encoderSpeed)
-			else:
-				self.videoEncoder0 = VideoEncoder(videoCodec, videoBitrate0, 2*videoKeyFrameInterval0, encoderThreads, encoderSpeed)
-			self.outPut0 = OutPut(self.startFileIndex, self.destination0, "0")
-			self.audioQueue0 = Gst.ElementFactory.make('queue2', None)
-
-			#self.pipeline.add(self.videoScale0)
-			self.pipeline.add(self.videoEncoder0)
-			self.pipeline.add(self.audioQueue0)
-			self.pipeline.add(self.outPut0)
-
-
-		self.audioLinked = False
-
-		# Connect signal handlers
-		self.player.connect('pad-added', self.on_pad_added)
-
-		# video decoder
-		self.videoParseDecoder.link(self.videoDecoder)
-		if(withDeinterlace):
-			self.videoDecoder.link(self.videoDeinterlace)
-			self.videoDeinterlace.link(self.inputVideoRate)
-		else:
-			self.videoDecoder.link(self.inputVideoRate)
-
-		if(targetFPS == 25):
-			self.inputVideoRate.link_filtered(self.videoDecTee,
-				Gst.caps_from_string('video/x-raw, framerate=25/1')
-			)
-		else:
-			self.inputVideoRate.link_filtered(self.videoDecTee,
-				Gst.caps_from_string('video/x-raw, framerate=50/1')
-			)
-
-		if(encoders[2]):
-			# quality 2
-			#	self.videoDecTee.link(self.identity2)
-			self.videoDecTee.link(self.videoRate2)
-			#        self.identity2.link(self.videoRate2)
-			self.videoRate2.link_filtered(self.videoScale2,
-				Gst.caps_from_string('video/x-raw, framerate=25/10')
-			)
-			self.videoScale2.link_filtered(self.videoEncoder2,
-				Gst.caps_from_string('video/x-raw, width=180, height=144')
-			)
-
-			self.videoEncoder2.link(self.outPut2.sink)
-
-		if(encoders[1]):
-			# quality 1
-			self.videoDecTee.link(self.videoScale1)
-			self.videoScale1.link_filtered(self.videoEncoder1,
-				Gst.caps_from_string('video/x-raw, width=360, height=288')
-			)
-			self.videoEncoder1.link(self.outPut1.sink)
-
-
-		if(encoders[0]):
-			# quality 0
-			self.videoDecTee.link(self.videoEncoder0)
-			#self.videoDecTee.link(self.videoScale0)
-			#self.videoScale0.link_filtered(self.videoEncoder0,
-			#	Gst.caps_from_string('video/x-raw, width=1280, height=720')
-			#)
-			self.videoEncoder0.link(self.outPut0.sink)
-
-		# audio decoder
-		self.audioParseDecoder.link(self.audioDecoder)
-
-		# noaudiorate
-		#self.audioDecoder.link(self.audioDecTee)
-
-		# audiorate
-		self.audioDecoder.link(self.inputAudioRate)
-		#self.inputAudioRate.link_filtered(self.audioDecTee,
-		#                      Gst.caps_from_string('audio/x-raw, format=S16LE, rate=48000')
-		#)
-
-		self.inputAudioRate.link_filtered(self.audioDecTee,
-			Gst.caps_from_string('audio/x-raw')
-		)
-
-
-		# audio tools
-		self.audioDecTee.link(self.audioEncoder)
-
-		self.audioEncoder.link_filtered(self.encAudioTee,
-			Gst.caps_from_string('audio/mpeg, stream-format=adts')
-		)
-		#self.audioEncoder.link_filtered(self.encAudioTee,
-		#                      Gst.caps_from_string('audio/mpeg, stream-format=raw')
-		#)
-
-		# audio for quality 2
-		#	self.hole.link_filtered(self.holeAudioEncoder, Gst.caps_from_string('audio/x-raw, channels=1, rate=8000'))
-		#	self.holeAudioEncoder.link_filtered(self.outPut2.sink,
-		#                                 Gst.caps_from_string('audio/mpeg, stream-format=adts'))
-		#        self.encAudioTee.link(self.audioQueue2)
-		#        self.audioQueue2.link(self.outPut2.sink)
-
-		#	# audio 2
-		#        self.encAudioTee.link(self.audioQueue2)
-		#        self.audioQueue2.link(self.outPut2.sink)
-
-		# audio for quality 0,1
-		if(encoders[1]):
-			self.encAudioTee.link(self.audioQueue1)
-			self.audioQueue1.link(self.outPut1.sink)
-
-		if(encoders[0]):
-			self.encAudioTee.link(self.audioQueue0)
-			#print "linking audiotee to sink"
-			self.audio_sink_pad = Gst.Element.get_request_pad(self.outPut0.sink, 'audio_%u')
-			#print "audio_sink_pad: ", self.audio_sink_pad, " || Type::: " , type(self.audio_sink_pad)
-			self.audio_src_pad = self.audioQueue0.get_static_pad("src")
-			#print "audio_src_pad: ", self.audio_src_pad, " || Type::: " , type(self.audio_src_pad)
-			#print Gst.Pad.link(self.audio_src_pad, self.audio_sink_pad);
-			#print 
-			Gst.Pad.link_maybe_ghosting(self.audio_src_pad, self.audio_sink_pad);
-			print("linking audiotee to sink DONE")
-
-		print(self)
-		Gst.debug_bin_to_dot_file( self.pipeline, Gst.DebugGraphDetails.ALL, 'pipeline')
-
-
-	def formatdestination(self, selectedChannelId, qualityPrefix):
-		return '/media/live/' + str(selectedChannelId) + '/' + qualityPrefix + '/' + '%010d.ts'
-
-	def formatdestinationdir(self, selectedChannelId, qualityPrefix):
-		return '/media/live/' + str(selectedChannelId) + '/' + qualityPrefix + '/'
+	def formatdestinationdir(self, outputRoot, selectedChannelId, qualityPrefix):
+		return os.path.join(outputRoot, str(selectedChannelId), qualityPrefix) + '/'
 
 	def getchannelinfo(self, channelVdrId):
 		startFileIndex = 0
@@ -590,165 +142,163 @@ class EncoderPipeline:
 
 		return (startFileIndex, self.currentChannel.id)
 
-	# def on_sync_message(self, bus, msg):
-	#     if (msg.src == self.outPut2.sink ):
-	#         print('on_sync_message:', msg, msg.type, msg.src)
+	def probeAudioTracks(self):
+		"""Audio tracks of the channel in ffmpeg's 0:a:N order. The first one stays muxed with the video
+		(directory 100), every further one is written to its own directory a<N>."""
+		try:
+			result = subprocess.run([ffprobeBinary, '-v', 'error', '-analyzeduration', '3000000', '-probesize', '5000000',
+				'-show_entries', 'stream=codec_type,codec_name,channels,channel_layout:stream_tags=language'
+				':stream_disposition=visual_impaired,hearing_impaired', '-of', 'json', self.uri],
+				capture_output=True, text=True, timeout=30)
+			streams = json.loads(result.stdout or '{}').get('streams', [])
+		except (subprocess.TimeoutExpired, ValueError) as e:
+			print('audio track probe failed, only the first audio track is kept:', e)
+			return []
+		tracks = []
+		for stream in streams:
+			if stream.get('codec_type') != 'audio':
+				continue
+			index = len(tracks)
+			language = stream.get('tags', {}).get('language', 'und')
+			disposition = stream.get('disposition', {})
+			tracks.append({
+				'name': 'a%d' % index,
+				'index': index,
+				'directory': '100' if index == 0 else 'a%d' % index,
+				'codec': stream.get('codec_name'),
+				'language': language if len(language) == 3 and language.isalpha() else 'und',
+				'channels': stream.get('channels'),
+				'layout': stream.get('channel_layout'),
+				'visualImpaired': bool(disposition.get('visual_impaired')),
+				'hearingImpaired': bool(disposition.get('hearing_impaired')),
+			})
+		print('audio tracks:', ', '.join('%s %s/%s' % (t['name'], t['codec'], t['language']) for t in tracks))
+		return tracks
 
-	def validate(self, time, outIndex):
-		return
-		global invalidTests
+	def writeTrackInfo(self, channelId):
+		info = {'channel': channelId, 'tracks': self.audioTracks}
+		tmp = os.path.join(self.channelDirectory, 'tracks.json.tmp')
+		with open(tmp, 'w') as f:
+			json.dump(info, f, indent=1)
+		os.replace(tmp, os.path.join(self.channelDirectory, 'tracks.json'))
 
-		timeStamps[outIndex] = time
-
-		#	if(timeStamps[0]==timeStamps[1] and timeStamps[1]==timeStamps[2]):
-		if(timeStamps[0]==timeStamps[1]):
-			invalidTests=0
-		else:
-			invalidTests=invalidTests+1
-
-		if(invalidTests > 10):
-			print("invalidTests", invalidTests)
-			print("!!!!!!!!!going to stop SEGMENT VALIDATE failed!!!!!!", time)
-			self.kill()
-
-	def on_message(self, bus, msg):
-		elementNameMessage = ""
-		if (msg.type == Gst.MessageType.ELEMENT):
-			elementNameMessage = Gst.Element.get_name(msg.src)
-
-		if (elementNameMessage == "splitmuxsink0"):
-			st = msg.get_structure();
-			if(st.get_name() == "splitmuxsink-fragment-closed"):
-				print(str(datetime.now()))
-				segmentRunningTime = st.get_value("running-time")
-				startSegmentIndex = self.outPut0.startFileId
-				currentSegmentIndex = self.outPut0.fileId
-				self.outPut0.fileId = self.outPut0.fileId + 1
-				segmentStartTime = appStartTime + ( (currentSegmentIndex - startSegmentIndex ) * defaultSegmentDuration / 1000000 )
-				#self.validate(segmentStartTime, int(Gst.Element.get_name(msg.src)[-1]))
-				print("[" + str(currentSegmentIndex) + "]time:" + str(time.gmtime(segmentStartTime / 1000)) + " segmentStartTime:" + str(segmentStartTime))
-				print(elementNameMessage + " running-time: " + str(segmentRunningTime))
-				self.validate( segmentRunningTime, int(Gst.Element.get_name(msg.src)[-1]))
-				newFile = FileSegment(fileId=currentSegmentIndex, startTime=segmentStartTime, channel=self.currentChannel, duration=(defaultSegmentDuration / 1000000))
-		elif (elementNameMessage == "splitmuxsink1"):
-			st = msg.get_structure();
-			if(st.get_name() == "splitmuxsink-fragment-closed"):
-				segmentRunningTime = st.get_value("running-time")
-				print(elementNameMessage + " running-time: " + str(segmentRunningTime))
-				self.validate( segmentRunningTime, int(Gst.Element.get_name(msg.src)[-1]))
-		elif (elementNameMessage == "splitmuxsink2"):
-			st = msg.get_structure();
-			if(st.get_name() == "splitmuxsink-fragment-closed"):
-				segmentRunningTime = st.get_value("running-time")
-				print(elementNameMessage + " running-time: " + str(segmentRunningTime))
-				self.validate( segmentRunningTime, int(Gst.Element.get_name(msg.src)[-1]))
-		elif (elementNameMessage == "multifilesink2"):
-			st = msg.get_structure();
-			print("running-time", st.get_value("running-time"))
-			print("stream-time", st.get_value("stream-time"))
-			
-			currentSegmentEndTime = st.get_value("stream-time")
-			#self.validate(currentSegmentEndTime)
-			self.validate(currentSegmentEndTime, int(Gst.Element.get_name(msg.src)[-1]))
-		elif (elementNameMessage == "multifilesink1"):
-			st = msg.get_structure();
-			print("running-time", st.get_value("running-time"))
-			print("stream-time", st.get_value("stream-time"))
-			
-			currentSegmentEndTime = st.get_value("stream-time")
-			self.validate(currentSegmentEndTime, int(Gst.Element.get_name(msg.src)[-1]))
-		elif (elementNameMessage == "multifilesink0"):
-			#             print('on_message:' , msg, msg.type, msg.src)
-			#             if (msg.type == Gst.MessageType.TAG):
-			#                 print(Gst.TagList.n_tags(msg.parse_tag()))
-			#                 tagList = msg.parse_tag()
-			#                 count = Gst.TagList.n_tags(tagList)
-			#                 for i in range(count) :
-			#                     print Gst.TagList.nth_tag_name(tagList, i)
-			#             el
-			# if (msg.type == Gst.MessageType.ELEMENT):
-			#                print('on_message:' , msg, msg.type, msg.src)
-			st = msg.get_structure();
-			#                print(st.get_name())
-			count = st.n_fields()
-			#                 print(count)
-			#                print("filename", st.get_value("filename"))
-			#                print("index", st.get_value("index"))
-			print("running-time", st.get_value("running-time"))
-			print("stream-time", st.get_value("stream-time"))
-			#                print("duration", st.get_value("duration"))
-			#                print("segment-duration", st.get_value("segment-duration"))
-
-			currentSegmentIndex = st.get_value("index")
-			currentSegmentIndex = currentSegmentIndex - 1
-			#currentSegmentEndTime = st.get_value("stream-time")
-			currentSegmentEndTime = st.get_value("running-time")
-
-			print("currentSegmentIndex", currentSegmentIndex)
-			#self.validate(currentSegmentEndTime)
-			self.validate(currentSegmentEndTime, int(Gst.Element.get_name(msg.src)[-1]))
-
-			global lastSegmentEndTime
-
-			# in ms
-			segmentDuration = (currentSegmentEndTime - lastSegmentEndTime) / 1000000
-
-			# in ms
-			segmentStartTime = appStartTime + (lastSegmentEndTime / 1000000)
-
-			print("[" + str(currentSegmentIndex) + "]time:" + str(time.gmtime(segmentStartTime / 1000)) + " segmentStartTime:" + str(segmentStartTime))
-
-			newFile = FileSegment(fileId=currentSegmentIndex, startTime=segmentStartTime, channel=self.currentChannel, duration=segmentDuration)
-
-			lastSegmentEndTime = currentSegmentEndTime
+	def ffmpegArguments(self):
+		segmentOptions = ['-c', 'copy', '-f', 'segment', '-segment_format', 'mpegts',
+			'-segment_time', str(defaultSegmentDuration / 1000000000),
+			'-segment_start_number', str(self.nextFileIndex)]
+		if self.copyTimestamps:
+			# without it the mpegts muxer shifts all timestamps by its mux delay (1.4 s)
+			segmentOptions += ['-segment_format_options', 'mpegts_copyts=1']
+		arguments = [ffmpegBinary, '-hide_banner', '-nostdin', '-nostats', '-loglevel', 'warning',
+			'-fflags', '+genpts+discardcorrupt', '-err_detect', 'ignore_err',
+			'-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_on_network_error', '1',
+			'-reconnect_delay_max', '5', '-rw_timeout', '15000000'] + (
+			['-copyts'] if self.copyTimestamps else []) + [
+			'-i', self.uri,
+			# first video and first audio track as before; '?' keeps channels without one working
+			'-map', '0:v:0?', '-map', '0:a:0?'] + segmentOptions + [
+			# cut at the first keyframe after every 10 s; each finished segment is reported on stdout
+			# as "file,start,end" (stream time in seconds)
+			'-segment_list', 'pipe:1', '-segment_list_type', 'csv',
+			self.destination0]
+		# further audio tracks: audio-only segments cut at every 10 s, numbered like the video segments
+		for track in self.audioTracks[1:]:
+			arguments += ['-map', '0:a:%d' % track['index']] + segmentOptions + [
+				os.path.join(self.channelDirectory, track['directory'], '%010d.ts')]
+		return arguments
 
 	def run(self):
-		self.pipeline.set_state(Gst.State.PLAYING)
-		self.mainloop.run()
+		while True:
+			arguments = self.ffmpegArguments()
+			print(' '.join(arguments))
+			sys.stdout.flush()
+			self.restart = None
+			self.segmentsInRun = 0
+			self.runStarted = self.lastSegmentClosed = time.monotonic()
+			self.process = subprocess.Popen(arguments, stdout=subprocess.PIPE, text=True)
+			threading.Thread(target=self.watchdog, args=(self.process,), daemon=True).start()
+			for entry in self.process.stdout:
+				self.on_segment_closed(entry.strip())
+				if time.monotonic() - self.runStarted > maxRunTime:
+					self.requestRestart('daily restart')
+			returnCode = self.process.wait()
+			# a run without any segment is left to the channel script's loop (it waits 60 s)
+			if self.restart is None or self.segmentsInRun == 0:
+				return returnCode
+			print('ffmpeg restarts (%s) with segment %d' % (self.restart, self.nextFileIndex))
 
 	def kill(self):
-		self.pipeline.set_state(Gst.State.NULL)
-		self.mainloop.quit()
+		if self.process and self.process.poll() is None:
+			self.process.terminate()
 
-	def on_pad_added(self, element, pad):
-		string = pad.query_caps(None).to_string()
-		print('on_pad_added():', string)
-		# print('on_pad_added():', str(pad))
-		print(self.pipeline)
-		#Gst.debug_bin_to_dot_file( self.pipeline, Gst.DebugGraphDetails.ALL, "error.dot")
-		# if string.startswith(
-		#         'audio/x-raw, format=(string)S16LE, layout=(string)interleaved, rate=(int)48000, channels=(int)2'):
-		#     if self.audioLinked == False:
-		#         pad.link(self.audioDecTee.get_static_pad('sink'))
-		#         #pad.link(self.audioEncoder.get_static_pad('sink'))
-		#         self.audioLinked = True
-		#     else:
-		#         print('audio already linked')
-		# elif string.startswith(
-		#         'audio/x-raw, format=(string)S16LE, layout=(string)interleaved, rate=(int)48000, channels=(int)1'):
-		#     if self.audioLinked == False:
-		#         pad.link(self.audioDecTee.get_static_pad('sink'))
-		#         # pad.link(self.audioEncoder.get_static_pad('sink'))
-		#         self.audioLinked = True
-		#     else:
-		#         print('audio already linked')
-		if string.startswith('audio/mpeg'):
-			if self.audioLinked == False:
-				pad.link(self.audioParseDecoder.get_static_pad('sink'))
-				self.audioLinked = True
-			else:
-				print('audio already linked')
-		elif string.startswith('video/'):
-			pad.link(self.videoParseDecoder.get_static_pad('sink'))
-			#pad.link(self.inputVideoRate.get_static_pad('sink'))
-			#pad.link(self.videoDecTee.get_static_pad('sink'))
-		Gst.debug_bin_to_dot_file( self.pipeline, Gst.DebugGraphDetails.ALL, "pad_added")
+	def requestRestart(self, reason):
+		if self.restart is None:
+			self.restart = reason
+			self.restartRequested = time.monotonic()
+			self.kill()
 
-	def on_eos(self, bus, msg):
-		print('on_eos():' , msg, msg.type, msg.src, Gst.Element.get_name(msg.src))
-		self.kill()
+	def watchdog(self, process):
+		"""Restarts ffmpeg when it stops finishing segments (no data, or source timestamps that jumped
+		back, so the segment muxer does not cut any more) and kills it when it ignores SIGTERM."""
+		while process.poll() is None:
+			time.sleep(1)
+			if self.restart is None and time.monotonic() - self.lastSegmentClosed > stallTimeout:
+				self.requestRestart('no segment for %d s' % stallTimeout)
+			elif self.restart is not None and time.monotonic() - self.restartRequested > 15:
+				process.kill()
 
-	def on_error(self, bus, msg):
-		#Gst.debug_bin_to_dot_file_with_ts( self.pipeline, Gst.DebugGraphDetails.ALL, "error.dot")
-		print('on_error():', msg.parse_error())
-		self.kill()
+	def firstSegmentStart(self, fileName, end):
+		"""Start of the first segment of a run, the segment list reports 0 for it. With copied timestamps
+		it is the first timestamp of the reference stream (video, else audio) in the file."""
+		try:
+			result = subprocess.run([ffprobeBinary, '-v', 'error', '-show_entries', 'stream=codec_type,start_time',
+				'-of', 'json', fileName], capture_output=True, text=True, timeout=10)
+			starts = {}
+			for stream in json.loads(result.stdout or '{}').get('streams', []):
+				if stream.get('start_time') not in (None, 'N/A'):
+					starts.setdefault(stream.get('codec_type'), float(stream['start_time']))
+			start = starts.get('video', starts.get('audio'))
+			if start is not None and 0 < end - start <= 3 * defaultSegmentDuration / 1000000000:
+				return start
+			print('no usable start time in', fileName, starts)
+		except (subprocess.TimeoutExpired, ValueError) as e:
+			print('cannot read the start time of', fileName, e)
+		return end - defaultSegmentDuration / 1000000000
+
+	def on_segment_closed(self, entry):
+		try:
+			fileName, start, end = entry.rsplit(',', 2)
+			fileId = int(os.path.splitext(os.path.basename(fileName))[0])
+			start = float(start)
+			end = float(end)
+		except ValueError:
+			print('unexpected segment list entry:', entry)
+			return
+
+		now = time.time()
+		maxDuration = 3 * defaultSegmentDuration / 1000000000
+		if self.segmentsInRun == 0:
+			if self.copyTimestamps:
+				start = self.firstSegmentStart(os.path.join(self.destinationdirectory0, os.path.basename(fileName)), end)
+			# stream time -> wall clock: the first segment of a run has just ended
+			self.clockOffset = end - now
+		elif not (0 < end - start <= maxDuration and abs(start - self.lastEnd) < 2):
+			# the source timestamps jumped: continue the database times from the previous segment,
+			# restart ffmpeg so that its segment muxer cuts every 10 s again
+			print('timestamp jump: previous segment ended at %.3f, this one is %.3f - %.3f' % (self.lastEnd, start, end))
+			if not 0 < end - start <= maxDuration:
+				start = end - max(0, now - self.lastSegmentWallEnd)
+			self.clockOffset = start - self.lastSegmentWallEnd
+			self.requestRestart('timestamp jump')
+		segmentStartTime = int(round((start - self.clockOffset) * 1000))
+		segmentDuration = int(round((end - start) * 1000))
+		self.lastEnd = end
+		self.lastSegmentWallEnd = end - self.clockOffset
+		self.segmentsInRun += 1
+		self.nextFileIndex = fileId + 1
+		self.lastSegmentClosed = time.monotonic()
+		print("[" + str(fileId) + "]time:" + str(time.gmtime(segmentStartTime / 1000)) +
+			" segmentStartTime:" + str(segmentStartTime) + " duration:" + str(segmentDuration))
+		sys.stdout.flush()
+		if self.registerSegments:
+			FileSegment(fileId=fileId, startTime=segmentStartTime, channel=self.currentChannel, duration=segmentDuration)
